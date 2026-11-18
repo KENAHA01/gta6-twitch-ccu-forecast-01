@@ -1,4 +1,4 @@
-"""Launch-day Twitch forecaster for GTA VI, rebuilt from the kit data.
+"""Launch-day Twitch forecaster for GTA VI, v2: weighted comparable quantiles.
 
 Idea: do not bake in any fitted numbers. At run time, read the case's
 own comparables (past big launches, hourly SullyGnome curves shipped in
@@ -6,29 +6,36 @@ the case file), pull each launch's 24 hourly viewer counts starting at
 its release-day midnight, and work in log-ratios to its hour-1 print.
 
 For a forecast hour h, the five quantiles are hour 1's print p1 times
-exp() of the empirical quantiles of ln(viewers_h / viewers_1) across
-comparable launches, widened a little around the median:
+exp() of the quantiles of ln(viewers_h / viewers_1) across comparable
+launches, widened a little around the median:
 
     q_tau(h) = p1 * exp(median_h + (q_tau_h - median_h) * WIDEN)
 
-Two pools are used, because big launches behave differently from
-smaller ones: their hour-1 print is already near the early peak, the
-median ratio dips to about 0.53 around hours 10-11 and climbs back to
-about 1.3 around hours 20-21 as the US audience unlocks. Launches
-whose hour-1 print was under 20,000 are left out entirely: their
-unlock was still hours away at 00:00 UTC, so their ratios explode
-100x-2000x and would poison the quantiles. When p1 is at least
-50,000, only launches with p1 at least 50,000 are used; otherwise
-every launch with p1 at least 20,000 is used.
+v2 weights each comparable by how close its hour-1 print is to the
+target's, in log space: a launch that opened at a similar scale counts
+more than one that opened 10x smaller or bigger. The weight is a
+Gaussian kernel on ln(p1) with sigma 1.0, floored at 0.05 so that no
+launch is ever fully ignored and the effective sample stays usable
+even when the target opens far above every comparable (GTA VI may):
+at p1 = 3,000,000 the effective sample is still about 11 launches,
+against about 5 without the floor. Launches whose hour-1 print was
+under 20,000 are left out entirely: their unlock was still hours away
+at 00:00 UTC, so their ratios explode 100x-2000x and would poison the
+quantiles.
 
 Leave-one-out backtest over the 27 launches with p1 >= 20,000 in the
 kit (each launch held out, quantiles fit from the rest, same log-scale
-pinball scorer as the contest): model 0.273 vs house baseline 0.321,
-winning 22 of 27 launches. WIDEN = 1.25 sits in the middle of a flat
-optimum (1.15 gives 0.274, 1.35 gives 0.273), so it is not a sharp
-tuned peak. The house baseline scores about 0.387 on the four
-practice cases; their true answers are not in the kit, so no direct
-practice score is claimed here.
+pinball scorer as the contest): v2 0.2652 vs v1 (unweighted, same
+widen) 0.2730 vs house baseline 0.3214, winning 22 of 27 launches.
+The gain is positive in 16 of 27 launches and holds for sigma 0.85
+to 1.2 (0.2653 to 0.2664), so it is not a knife-edge tuning. Without
+the 0.05 weight floor the LOO would be 0.2645, a hair better, but the
+floor is kept anyway: it costs 0.0007 and buys a usable effective
+sample when the target opens far above every comparable. Smoothing
+the quantiles across hours and filtering by the research-note tier
+were both tried and did not help. The house baseline scores about
+0.387 on the four practice cases; their true answers are not in the
+kit, so no direct practice score is claimed here.
 
 Python 3.13 standard library only, no network, deterministic: the
 same input bytes give the same output bytes. Reads every *.in in
@@ -50,19 +57,33 @@ OUTPUT_DIR = Path(os.environ.get("MAKEFUN_OUTPUT_DIR", "/output"))
 
 LEVELS = [0.05, 0.25, 0.5, 0.75, 0.95]
 MIN_P1 = 20000
-BIG_P1 = 50000
 WIDEN = 1.25
+SIGMA = 1.0
+WEIGHT_FLOOR = 0.05
 
 
-def empirical_quantile(sorted_values, tau):
-    """Linear-interpolation quantile of a sorted list."""
-    if len(sorted_values) == 1:
-        return sorted_values[0]
-    pos = tau * (len(sorted_values) - 1)
-    low = int(pos)
-    high = min(low + 1, len(sorted_values) - 1)
-    frac = pos - low
-    return sorted_values[low] * (1.0 - frac) + sorted_values[high] * frac
+def weighted_quantile(pairs, tau):
+    """Quantile of values with weights, by linear interpolation.
+
+    pairs is a list of (value, weight) sorted by value. The target
+    cumulative weight is tau times the total weight; the answer is
+    interpolated inside the step where that target is crossed.
+    """
+    pairs = sorted(pairs)
+    total = sum(weight for _, weight in pairs)
+    if total <= 0:
+        return None
+    target = tau * total
+    acc = 0.0
+    for i, (value, weight) in enumerate(pairs):
+        acc += weight
+        if acc >= target:
+            if i == 0 or weight <= 0:
+                return value
+            prev_value, _ = pairs[i - 1]
+            frac = (target - (acc - weight)) / weight
+            return prev_value + (value - prev_value) * frac
+    return pairs[-1][0]
 
 
 def day_curve(comparable):
@@ -127,36 +148,36 @@ def forecast_case(case):
         curve = day_curve(comparable)
         if curve is not None and curve[0] >= MIN_P1:
             pool.append(curve)
-    threshold = BIG_P1 if p1 >= BIG_P1 else MIN_P1
-    chosen = [curve for curve in pool if curve[0] >= threshold]
-    if len(chosen) < 5:
-        chosen = pool
-    if not chosen:
+    if not pool:
         # No comparable cleared MIN_P1 (a tiny hour-1 print, or a
         # sparse case): use every full curve we have, whatever its
         # hour-1 size, rather than falling back to a flat forecast.
         # Only when there is no full curve at all do we use the
         # house shape, a flat median with a widening spread.
-        chosen = []
         for comparable in case.get("comparables", []):
             curve = day_curve(comparable)
             if curve is not None:
-                chosen.append(curve)
-        if not chosen:
-            chosen = None
+                pool.append(curve)
+    log_p1 = math.log(p1)
+    weights = []
+    for curve in pool:
+        gap = math.log(curve[0]) - log_p1
+        weight = math.exp(-(gap * gap) / (2.0 * SIGMA * SIGMA))
+        weights.append(max(weight, WEIGHT_FLOOR))
     hours = []
     for hour in range(2, 25):
-        if chosen is None:
+        if not pool:
             spread = 0.15 * math.sqrt(hour - 1)
             quantiles = [
                 p1 * math.exp(z * spread)
                 for z in (-1.645, -0.674, 0.0, 0.674, 1.645)
             ]
         else:
-            ratios = sorted(
-                math.log(curve[hour - 1] / curve[0]) for curve in chosen
-            )
-            fitted = [empirical_quantile(ratios, tau) for tau in LEVELS]
+            pairs = [
+                (math.log(curve[hour - 1] / curve[0]), weight)
+                for curve, weight in zip(pool, weights)
+            ]
+            fitted = [weighted_quantile(pairs, tau) for tau in LEVELS]
             median = fitted[2]
             quantiles = [
                 p1 * math.exp(median + (q - median) * WIDEN) for q in fitted

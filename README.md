@@ -12,39 +12,37 @@ hour of its release day (2026-11-19 UTC), hours 2-24, as five quantiles
 ## Model
 
 `main.py` (Python 3.13, standard library only, no network, deterministic)
-anchors on hour 1's print `p1` and multiplies it by a fitted launch-day
-curve:
+reads the case's own comparables at run time: past big game launches
+with their hourly SullyGnome Twitch curves. It anchors on hour 1's
+print `p1` and multiplies it by the shape of a launch day:
 
 ```
 q_tau(h) = p1 * exp(median_h + (q_tau_h - median_h) * 1.25)
 ```
 
-`(q05, q25, q50, q75, q95)_h` are the empirical quantiles of
-`ln(viewers_h / viewers_1)` over past big game launches' release days,
-taken from the comparables shipped in the kit (SullyGnome hourly
-Twitch category averages). Two fits are baked in as literal tables:
+`(q05, q25, q50, q75, q95)_h` are quantiles of `ln(viewers_h / viewers_1)`
+across the comparables, but not plain ones: each launch is weighted by
+how close its hour-1 print is to the target's, in log space (Gaussian
+kernel, sigma 1.0, weight floored at 0.05). A launch that opened at a
+similar scale counts more than one that opened 10x smaller or bigger,
+and the floor keeps the effective sample usable even if GTA VI opens
+far above every comparable. Launches with an hour-1 print under 20,000
+are left out: at 00:00 UTC their unlock was still hours away, so their
+ratios explode 100x-2000x and would poison the quantiles.
 
-- **BASE_Q** - 27 launches with hour-1 print >= 20,000 viewers.
-- **BIG_Q** - 20 launches with hour-1 print >= 50,000 viewers, used
-  when `p1 >= 50,000`. Big launches behave differently: hour 1 is
-  already near the early peak (median ratio dips to ~0.53 around
-  hours 10-11, then climbs to ~1.36 around hours 20-21 as the US
-  audience unlocks and prime time arrives).
-
-Launches with a tiny hour-1 print were excluded: at 00:00 UTC their
-unlock was still hours away, so their ratios explode 100x-2000x and
-would poison the quantiles. The 1.25 tail widening corrects for the
-small fit samples (20-27 launches); leave-one-out backtesting picked
-1.2-1.4 as a flat optimum.
+Nothing is baked into the file: no fitted tables, no GTA VI numbers.
+The same program on a different case forecasts that case from its own
+comparables.
 
 ## Backtest
 
 Leave-one-out over the 27 launches with hour-1 >= 20,000 (each launch
 held out, fit from the rest, mean pinball loss on the log scale, the
-contest's own scorer): **model 0.273 vs house baseline 0.321**.
-The house baseline scores about 0.387 on the four practice cases;
-their true answers are not in the kit, so no direct practice score
-is claimed.
+contest's own scorer): **v2 0.2652 vs v1 unweighted 0.2730 vs house
+baseline 0.3214**, winning 22 of 27 launches. The gain holds for
+sigma 0.85 to 1.2, so it is not a knife-edge tuning. The house baseline
+scores about 0.387 on the four practice cases; their true answers are
+not in the kit, so no direct practice score is claimed.
 
 ## Run
 
@@ -56,7 +54,8 @@ MAKEFUN_INPUT_DIR=input MAKEFUN_OUTPUT_DIR=out python3 main.py
 Reads every `*.in` in the input directory and writes `<id>.out` per
 case: `{"hours": [{"hour": 2, "q": [...]}, ...]}` with exactly 23 rows
 (hours 2-24), each quantile finite, > 0, <= 1e9, non-decreasing,
-rounded half-up to 2 decimals.
+rounded half-up to 2 decimals. Four practice cases run in about
+0.15 seconds, byte-identical on repeat runs.
 
 ## License
 
